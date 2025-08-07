@@ -17,7 +17,7 @@ export default function Page() {
     setLoading(true);
     setQuestion("");
 
-    const res = await fetch("http://localhost:8000/query", {
+    const res = await fetch("https://rag-chatbot-itut.onrender.com/query", { // import hereeeeeee http://localhost:8000/query
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ question }),
@@ -49,7 +49,7 @@ export default function Page() {
     formData.append("file", file);
 
     try {
-      const res = await fetch("http://localhost:8000/upload", {
+      const res = await fetch("https://rag-chatbot-itut.onrender.com/upload", { // important heree http://localhost:8000/upload
         method: "POST",
         body: formData,
       });
