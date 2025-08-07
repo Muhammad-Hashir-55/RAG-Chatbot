@@ -5,8 +5,8 @@ export default function Page() {
   const [messages, setMessages] = useState([]);
   const [question, setQuestion] = useState("");
   const [loading, setLoading] = useState(false);
+  const [uploadedFiles, setUploadedFiles] = useState([]);
   const [uploading, setUploading] = useState(false);
-  const [uploadStatus, setUploadStatus] = useState("");
   const chatEndRef = useRef(null);
 
   const handleSend = async () => {
@@ -37,11 +37,13 @@ export default function Page() {
   };
 
   const handleFileChange = async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
 
+    const file = files[0];
+    const newFile = { name: file.name, status: "Uploading..." };
+    setUploadedFiles((prev) => [...prev, newFile]);
     setUploading(true);
-    setUploadStatus("Uploading...");
 
     const formData = new FormData();
     formData.append("file", file);
@@ -53,12 +55,24 @@ export default function Page() {
       });
 
       if (res.ok) {
-        setUploadStatus("✅ File uploaded & indexed!");
+        setUploadedFiles((prev) =>
+          prev.map((f) =>
+            f.name === file.name ? { ...f, status: "✅ Uploaded" } : f
+          )
+        );
       } else {
-        setUploadStatus("❌ Upload failed.");
+        setUploadedFiles((prev) =>
+          prev.map((f) =>
+            f.name === file.name ? { ...f, status: "❌ Failed" } : f
+          )
+        );
       }
     } catch (err) {
-      setUploadStatus("❌ Upload error.");
+      setUploadedFiles((prev) =>
+        prev.map((f) =>
+          f.name === file.name ? { ...f, status: "❌ Error" } : f
+        )
+      );
     }
 
     setUploading(false);
@@ -70,21 +84,48 @@ export default function Page() {
 
   return (
     <main className="min-h-screen bg-gradient-to-br from-blue-100 to-purple-100 flex items-center justify-center px-4 py-6">
-      <div className="w-full max-w-2xl bg-white rounded-lg shadow-xl p-6 flex flex-col">
-        <h1 className="text-2xl font-bold text-center mb-4 text-black">💬 RAG AI Assistant</h1>
+      <div className="w-full max-w-3xl bg-white rounded-lg shadow-xl p-6 flex flex-col">
+        <h1 className="text-2xl font-bold text-center mb-6 text-black">💬 RAG AI Assistant</h1>
 
         {/* Upload Section */}
-        <div className="mb-4 flex items-center gap-4">
-          <input
-            type="file"
-            accept=".pdf"
-            onChange={handleFileChange}
-            className="text-sm"
-          />
-          {uploading ? (
-            <span className="text-blue-600 text-sm">Uploading...</span>
-          ) : (
-            uploadStatus && <span className="text-green-600 text-sm">{uploadStatus}</span>
+        <div className="mb-6">
+          <label
+            htmlFor="file-upload"
+            className="flex flex-col items-center justify-center w-full border-2 border-dashed border-gray-300 rounded-lg p-6 cursor-pointer hover:bg-gray-100 transition"
+          >
+            <svg
+              className="w-10 h-10 mb-2 text-gray-400"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              viewBox="0 0 24 24"
+            >
+              <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a2 2 0 002 2h12a2 2 0 002-2v-1M12 12v9m0 0l-3-3m3 3l3-3M12 3v9" />
+            </svg>
+            <p className="text-gray-500 text-sm">Click to upload or drag a PDF file here</p>
+            <input
+              id="file-upload"
+              type="file"
+              accept=".pdf"
+              onChange={handleFileChange}
+              className="hidden"
+            />
+          </label>
+
+          {/* Uploaded Files List */}
+          {uploadedFiles.length > 0 && (
+            <div className="mt-4 space-y-1">
+              <h3 className="text-sm font-medium text-gray-700">Uploaded Files:</h3>
+              {uploadedFiles.map((file, idx) => (
+                <div
+                  key={idx}
+                  className="flex justify-between items-center text-sm bg-gray-100 p-2 rounded"
+                >
+                  <span className="text-gray-800 truncate">{file.name}</span>
+                  <span className="text-xs">{file.status}</span>
+                </div>
+              ))}
+            </div>
           )}
         </div>
 

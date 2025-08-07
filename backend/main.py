@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_community.document_loaders import PyPDFLoader
@@ -7,25 +7,26 @@ from langchain.chains import ConversationalRetrievalChain
 from langchain_google_genai import GoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain.prompts import PromptTemplate
 from langchain.memory import ConversationBufferMemory
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from dotenv import load_dotenv
-import os
-from fastapi import UploadFile, File
 from pathlib import Path
 import shutil
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-
+from fastapi import HTTPException
+from difflib import SequenceMatcher
+import os
 
 # Load environment variables
 load_dotenv()
 
-# Paths
-PDF_PATH = "data/"
+# Directories
+UPLOAD_FOLDER = Path("data")
 INDEX_DIR = "faiss_index"
+UPLOAD_FOLDER.mkdir(exist_ok=True)
+Path(INDEX_DIR).mkdir(exist_ok=True)
 
-# FastAPI app
+# FastAPI app setup
 app = FastAPI()
 
-# Allow frontend access
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -34,35 +35,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load or create FAISS vectorstore
-def load_or_create_vectorstore():
-    if os.path.exists(f"{INDEX_DIR}/index.faiss"):
-        print("🔁 Loading existing FAISS index...")
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-        return FAISS.load_local(INDEX_DIR, embeddings, allow_dangerous_deserialization=True)
-    else:
-        print("📄 Loading PDF and creating vectorstore...")
-        loader = PyPDFLoader(PDF_PATH)
-        docs = loader.load()
-        embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-        db = FAISS.from_documents(docs, embeddings)
-        db.save_local(INDEX_DIR)
-        return db
-
-# Initialize components
-vectorstore = load_or_create_vectorstore()
-retriever = vectorstore.as_retriever()
+# Global chain, memory, retriever
 llm = GoogleGenerativeAI(model="gemini-2.5-flash")
 
-# Custom prompt to control LLM behavior
 custom_prompt = PromptTemplate(
     input_variables=["chat_history", "question", "context"],
     template="""
 You are a helpful assistant answering questions from a document.
-try stick to the context provided.
-If the question is irrelevant or outside the document, politely respond: 
-"I'm only trained to answer questions based on the document content." or any other similar answer
-and if ever someone asks you who trained you or who owns you respond Hashir made me or similar like this
+Try to stick to the provided context.
+If the question is irrelevant or outside the document, politely respond:
+"I'm only trained to answer questions based on the document content."
+If asked who created or trained you, reply with:
+"Hashir made me" or something similar.
 
 Context:
 {context}
@@ -77,83 +61,131 @@ Answer:
 """
 )
 
-# Add memory to store chat history
-memory = ConversationBufferMemory(
-    memory_key="chat_history",
-    return_messages=True
-)
-
-# Create Conversational RAG chain
 memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True, output_key="answer")
 
-qa_chain = ConversationalRetrievalChain.from_llm(
-    llm=llm,
-    retriever=retriever,
-    memory=memory,
-    combine_docs_chain_kwargs={"prompt": custom_prompt},
-    return_source_documents=True,
-)
+def process_all_pdfs():
+    """Load all PDFs, split, embed and return a FAISS vectorstore"""
+    all_docs = []
+    for pdf_file in UPLOAD_FOLDER.glob("*.pdf"):
+        loader = PyPDFLoader(str(pdf_file))
+        all_docs.extend(loader.load())
 
-UPLOAD_FOLDER = Path("data")  # where your PDFs will go
+    if not all_docs:
+        return None
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    chunks = splitter.split_documents(all_docs)
+
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    vectorstore = FAISS.from_documents(chunks, embeddings)
+    vectorstore.save_local(INDEX_DIR)
+
+    return vectorstore
+
+def clean_faiss_index(db, embeddings):
+    """Remove indexed data from deleted files"""
+    # Get existing PDFs in the upload folder
+    existing_files = set(str(p.resolve()) for p in UPLOAD_FOLDER.glob("*.pdf"))
+
+    # Get all docs from FAISS index
+    all_docs = db.similarity_search(".")
+
+    # Keep only those whose source file still exists
+    valid_docs = [
+        doc for doc in all_docs
+        if Path(doc.metadata.get("source", "")).resolve().__str__() in existing_files
+    ]
+
+    if len(valid_docs) < len(all_docs):
+        print("🧹 Some documents were deleted. Rebuilding FAISS without them...")
+        db = FAISS.from_documents(valid_docs, embeddings)
+        db.save_local(INDEX_DIR)
+
+    return db
+
+def create_qa_chain():
+    """Create or rebuild the QA chain with FAISS cleanup"""
+    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+    faiss_path = Path(INDEX_DIR, "index.faiss")
+
+    if not faiss_path.exists():
+        print("⚠️ No FAISS index found.")
+        return None
+
+    db = FAISS.load_local(INDEX_DIR, embeddings, allow_dangerous_deserialization=True)
+    db = clean_faiss_index(db, embeddings)  # Clean up deleted sources
+
+    retriever = db.as_retriever()
+    return ConversationalRetrievalChain.from_llm(
+        llm=llm,
+        retriever=retriever,
+        memory=memory,
+        combine_docs_chain_kwargs={"prompt": custom_prompt},
+        return_source_documents=True,
+    )
+
+# Initialize QA chain on startup
+qa_chain = create_qa_chain()
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     file_path = UPLOAD_FOLDER / file.filename
 
-    # Save uploaded PDF
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    # Refresh retriever with updated data
-    global retriever
-    retriever = process_all_pdfs().as_retriever()
+    # Rebuild the FAISS index and reload chain
+    vectorstore = process_all_pdfs()
+    global qa_chain
+    qa_chain = create_qa_chain()
 
-    return {"filename": file.filename, "status": "uploaded and indexed"}
+    return {"filename": file.filename, "status": "✅ Uploaded and indexed"}
 
+@app.get("/files")
+async def list_uploaded_files():
+    """List current PDFs in the /data folder"""
+    files = [f.name for f in UPLOAD_FOLDER.glob("*.pdf")]
+    return {"files": files}
 
-
-def process_all_pdfs():
-    docs = []
-    
-    for file in UPLOAD_FOLDER.glob("*.pdf"):
-        loader = PyPDFLoader(str(file))
-        docs.extend(loader.load())
-    
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-    chunks = text_splitter.split_documents(docs)
-
-    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-
-    vectorstore = FAISS.from_documents(chunks, embeddings)
-    vectorstore.save_local("faiss_index")  # Optional
-
-    return vectorstore
-
-
-# Request body model
 class Query(BaseModel):
     question: str
 
-# Endpoint to ask questions
+
+
+
+
 @app.post("/query")
 async def ask_question(query: Query):
+    global qa_chain
+    if qa_chain is None:
+        return {"answer": "No documents found. Please upload a PDF first."}
+
     print(f"🔍 Received: {query.question}")
     result = qa_chain.invoke({"question": query.question})
 
-    # Extract sources
-    sources = []
-    for doc in result.get("source_documents", []):
-        metadata = doc.metadata
-        source_info = f"{metadata.get('source', 'Unknown')} - Page {metadata.get('page', '?')}"
-        sources.append(source_info)
+    answer = result.get("answer", "")
+    source_docs = result.get("source_documents", [])
 
-    
-    # Join sources into a readable string
-    source_string = ", ".join(sources)
+    # ✅ Check if sources are truly relevant using simple heuristic
+    relevant_sources = []
+    for doc in source_docs:
+        content = doc.page_content
+        similarity = SequenceMatcher(None, content.lower(), answer.lower()).ratio()
 
-    # Append the sources directly to the answer
-    answer_with_sources = f"{result.get('answer')}\n\n📚 Sources: {source_string}"
+        # Heuristic: Only include if answer is at least 15% similar to source content
+        if similarity >= 0.13:
+            metadata = doc.metadata
+            source = metadata.get('source', 'Unknown')
+            if(source not in relevant_sources):
+                relevant_sources.append(f"{Path(source).name}")
 
-    return {
-        "answer": answer_with_sources
-    }
+    # ✅ Final answer string with or without sources
+    if relevant_sources:
+        source_str = ", ".join(relevant_sources)
+        answer += f"\n\n📚 Sources: {source_str}"
+    else:
+        answer += "\n\n📚 Sources: None found or FAISS is currently Processing (possibly AI's own knowledge)."
+
+    return {"answer": answer}
+
+
