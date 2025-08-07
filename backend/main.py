@@ -95,6 +95,9 @@ def clean_faiss_index(db, embeddings):
         doc for doc in all_docs
         if Path(doc.metadata.get("source", "")).resolve().__str__() in existing_files
     ]
+    if not valid_docs:
+        print("No valid documents found to build the FAISS index.")
+        return db  # Or return None
 
     if len(valid_docs) < len(all_docs):
         print("🧹 Some documents were deleted. Rebuilding FAISS without them...")
